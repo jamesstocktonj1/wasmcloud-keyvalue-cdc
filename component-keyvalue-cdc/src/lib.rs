@@ -3,7 +3,7 @@ wit_bindgen::generate!({
 });
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use exports::wasi::keyvalue::store::{BucketBorrow, Guest, GuestBucket};
 use exports::wasi::keyvalue::atomics;
@@ -19,53 +19,50 @@ fn map_lock<'a, T, U>(
     f(lock).map_err(|err| store::Error::Other(err.to_string()))
 }
 
-#[derive(Clone, Default)]
-pub struct KvBucket(Arc<RwLock<HashMap<String, Vec<u8>>>>);
+pub struct KvBucket {
+    buckets: Arc<RwLock<wasi::keyvalue::store::Bucket>>,
+}
 
 impl KvBucket {
-    fn read(&self) -> Result<RwLockReadGuard<'_, HashMap<String, Vec<u8>>>> {
-        map_lock(&self.0, RwLock::read)
+    fn read(&self) -> Result<RwLockReadGuard<'_, wasi::keyvalue::store::Bucket>> {
+        map_lock(&self.buckets, RwLock::read)
     }
 
-    fn write(&self) -> Result<RwLockWriteGuard<'_, HashMap<String, Vec<u8>>>> {
-        map_lock(&self.0, RwLock::write)
+    fn write(&self) -> Result<RwLockWriteGuard<'_, wasi::keyvalue::store::Bucket>> {
+        map_lock(&self.buckets, RwLock::write)
     }
 }
 
 impl GuestBucket for KvBucket {
     fn get(&self, key: String) -> Result<Option<Vec<u8>>> {
         let bucket = self.read()?;
-        Ok(bucket.get(&key).cloned())
+        bucket.get(&key)
+            .map_err(|err| store::Error::Other(err.to_string()))
     }
 
     fn set(&self, key: String, value: Vec<u8>) -> Result<()> {
-        let mut bucket = self.write()?;
-        bucket.insert(key, value);
-        Ok(())
+        let bucket = self.write()?;
+        bucket.set(&key, &value)
+            .map_err(|err| store::Error::Other(err.to_string()))
     }
 
     fn delete(&self, key: String) -> Result<()> {
         let mut bucket = self.write()?;
-        bucket.remove(&key);
-        Ok(())
+        bucket.delete(&key)
+        .map_err(|err| store::Error::Other(err.to_string()))
     }
 
     fn exists(&self, key: String) -> Result<bool> {
         let bucket = self.read()?;
-        Ok(bucket.contains_key(&key))
+        bucket.exists(&key)
+            .map_err(|err| store::Error::Other(err.to_string()))
     }
 
     fn list_keys(&self, cursor: Option<u64>) -> Result<KeyResponse> {
         let bucket = self.read()?;
-        let bucket = bucket.keys();
-        let keys = if let Some(cursor) = cursor {
-            let cursor =
-                usize::try_from(cursor).map_err(|err| store::Error::Other(err.to_string()))?;
-            bucket.skip(cursor).cloned().collect()
-        } else {
-            bucket.cloned().collect()
-        };
-        Ok(KeyResponse { keys, cursor: None })
+        bucket.list_keys(cursor)
+            .map(| keys| KeyResponse { keys: keys.keys, cursor: keys.cursor })
+            .map_err(|err| store::Error::Other(err.to_string()))
     }
 }
 
@@ -75,11 +72,11 @@ impl Guest for Handler {
     type Bucket = KvBucket;
 
     fn open(identifier: String) -> Result<store::Bucket> {
-        static STORE: OnceLock<Mutex<HashMap<String, KvBucket>>> = OnceLock::new();
-        let store = STORE.get_or_init(Mutex::default);
-        let mut store = store.lock().expect("failed to lock store");
-        let bucket = store.entry(identifier).or_default().clone();
-        Ok(store::Bucket::new(bucket))
+        let bucket = wasi::keyvalue::store::open("")
+            .expect("error opening bucket");
+        Ok(store::Bucket::new(KvBucket {
+            buckets: Arc::new(RwLock::new(bucket)),
+        }))
     }
 }
 
